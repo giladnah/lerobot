@@ -321,15 +321,24 @@ class ACT(nn.Module):
 
         # Backbone for image feature extraction.
         if self.config.image_features:
-            backbone_model = getattr(torchvision.models, config.vision_backbone)(
-                replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
-                weights=config.pretrained_backbone_weights,
-                norm_layer=FrozenBatchNorm2d,
-            )
-            # Note: The assumption here is that we are using a ResNet model (and hence layer4 is the final
-            # feature map).
-            # Note: The forward method of this returns a dict: {"feature_map": output}.
-            self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
+            if config.use_hailo_backbone:
+                from lerobot.policies.act.hailo_backbone import HailoBackbone
+
+                self.backbone = HailoBackbone(config.hailo_hef_path)
+                backbone_feature_dim = 512  # ResNet18 layer4 output channels
+            else:
+                backbone_model = getattr(torchvision.models, config.vision_backbone)(
+                    replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
+                    weights=config.pretrained_backbone_weights,
+                    norm_layer=FrozenBatchNorm2d,
+                )
+                # Note: The assumption here is that we are using a ResNet model (and hence layer4 is the
+                # final feature map).
+                # Note: The forward method of this returns a dict: {"feature_map": output}.
+                self.backbone = IntermediateLayerGetter(
+                    backbone_model, return_layers={"layer4": "feature_map"}
+                )
+                backbone_feature_dim = backbone_model.fc.in_features
 
         # Transformer (acts as VAE decoder when training with the variational objective).
         self.encoder = ACTEncoder(config)
@@ -348,7 +357,7 @@ class ACT(nn.Module):
         self.encoder_latent_input_proj = nn.Linear(config.latent_dim, config.dim_model)
         if self.config.image_features:
             self.encoder_img_feat_input_proj = nn.Conv2d(
-                backbone_model.fc.in_features, config.dim_model, kernel_size=1
+                backbone_feature_dim, config.dim_model, kernel_size=1
             )
         # Transformer encoder positional embeddings.
         n_1d_tokens = 1  # for the latent

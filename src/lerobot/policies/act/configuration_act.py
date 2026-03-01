@@ -115,6 +115,10 @@ class ACTConfig(PreTrainedConfig):
     latent_dim: int = 32
     n_vae_encoder_layers: int = 4
 
+    # Hailo accelerator.
+    use_hailo_backbone: bool = False
+    hailo_hef_path: str | None = None
+
     # Inference.
     # Note: the value used in ACT when temporal ensembling is enabled is 0.01.
     temporal_ensemble_coeff: float | None = None
@@ -132,10 +136,12 @@ class ACTConfig(PreTrainedConfig):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
-        if not self.vision_backbone.startswith("resnet"):
+        if not self.use_hailo_backbone and not self.vision_backbone.startswith("resnet"):
             raise ValueError(
                 f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
             )
+        if self.use_hailo_backbone and not self.hailo_hef_path:
+            raise ValueError("`hailo_hef_path` must be set when `use_hailo_backbone` is True.")
         if self.temporal_ensemble_coeff is not None and self.n_action_steps > 1:
             raise NotImplementedError(
                 "`n_action_steps` must be 1 when using temporal ensembling. This is "

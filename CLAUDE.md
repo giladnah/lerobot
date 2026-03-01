@@ -6,6 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 LeRobot is a Hugging Face library for state-of-the-art machine learning in real-world robotics. It provides policies (ACT, Diffusion, TDMPC, VQ-BeT, SmolVLA, etc.), robot interfaces, dataset management, and simulation environments. Python 3.10+ required.
 
+## Environment
+
+This project uses a **venv** at `.venv/`. Always use `.venv/bin/python` or activate it first. The Hailo Python bindings (`hailo_platform`) are already installed in the venv from the HailoRT 5.2.0 wheel. Hailo SDK packages can be downloaded via the official downloader: `curl -O https://dev-public.hailo.ai/scripts/common/artifacts_downloader.sh && ./artifacts_downloader.sh -d H10 -p hailort -v 5.2.0`. On this machine, packages are also available at `~/Desktop/Hailo_installation/5.2.0/`.
+
 ## Common Commands
 
 ### Installation
@@ -79,6 +83,29 @@ When adding a new policy: update `available_policies` and `available_policies_pe
 
 ### Dependency Conflicts
 `wallx` and `pi` extras pin incompatible `transformers` versions — they conflict with `smolvla`, `groot`, `xvla`, and each other. Managed via `uv` conflict groups in `pyproject.toml`.
+
+## Current Task
+
+**Accelerating ACT with Hailo** — Offload the ResNet18 vision backbone in the ACT policy to a Hailo-10H AI accelerator. The goal is to reduce inference latency for real-time robot control by moving the most compute-intensive part (image feature extraction) to dedicated hardware while the transformer encoder/decoder runs on CPU. See the [Hailo Acceleration Guide](docs/guide_hailo_acceleration.md) for full details.
+
+Key files:
+- `src/lerobot/policies/act/hailo_backbone.py` — drop-in HailoBackbone module
+- `src/lerobot/policies/act/configuration_act.py` — `use_hailo_backbone` / `hailo_hef_path` config fields
+- `src/lerobot/policies/act/modeling_act.py` — backbone switch logic (line 324)
+- `scripts/hailo/` — all Hailo scripts, artifacts, reports, and tests
+- `scripts/hailo/compile_resnet18_hef.py` — HEF compilation with experiment flags
+- `scripts/hailo/analyze_layer_noise.py` — per-layer SNR analysis
+- `scripts/hailo/run_experiments.py` — experiment sweep orchestrator
+- `scripts/hailo/artifacts/resnet18_layer4.hef` — pre-compiled HEF for Hailo-10H (480x640 input)
+- `scripts/hailo/reports/` — experiment reports and findings
+
+## Guides
+
+- [Evaluating ACT in Aloha Simulation](docs/guide_act_aloha_eval.md) — running pretrained ACT policy inference, checkpoint migration, expected results
+- [Accelerating ACT with Hailo](docs/guide_hailo_acceleration.md) — Hailo backbone setup, HEF compilation pipeline, eval commands, benchmarking plan
+- [INT8 Accuracy Report](scripts/hailo/reports/report_hailo_int8_accuracy.md) — comprehensive INT8 quantization findings
+- [Experiment Results](scripts/hailo/reports/report_experiments.md) — systematic optimization experiment log
+- Hailo DFC PDFs: `~/Desktop/Hailo_installation/5.2.0/hailo_dataflow_compiler_v5.2.0_user_guide.pdf`
 
 ## Code Style Notes
 - Line length: 110

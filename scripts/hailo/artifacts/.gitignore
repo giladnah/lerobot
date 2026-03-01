@@ -1,0 +1,7 @@
+# Binary artifacts — regenerate with the scripts in scripts/hailo/
+# See docs/guide_hailo_acceleration.md for the full pipeline.
+*.hef
+*.har
+*.onnx
+*.onnx.data
+*.npy
