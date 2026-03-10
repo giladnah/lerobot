@@ -7,8 +7,9 @@ Supports configurable optimization experiments via CLI flags for:
 - Optimization level (0-4, with 4=AdaRound)
 - Compression level (0-2)
 - Activation/weights clipping on specified layers
-- Per-layer FP16 precision (a16_w16)
-- Post-quantization finetuning
+- Per-layer precision mode (a16_w16, a16_w8, a16_w4, a8_w4)
+- Calibration dataset size (calibset_size — DFC default is only 64)
+- Post-quantization finetuning (with configurable loss type)
 
 Prerequisites:
     1. Export ONNX:  python scripts/hailo/export_resnet18_onnx.py
@@ -78,14 +79,23 @@ def build_model_script(
     optimization_level: int = 4,
     compression_level: int = 0,
     batch_size: int = 4,
+    calibset_size: int = 1024,
+    normalization_mean: list[float] | None = None,
+    normalization_std: list[float] | None = None,
     activation_clipping: str | None = None,
     weights_clipping: str | None = None,
     fp16_layers: str | None = None,
+    precision_mode: str = "a16_w16",
+    fp16_layers_b: str | None = None,
+    precision_mode_b: str = "a16_w16",
     finetune: bool = False,
     finetune_epochs: int = 8,
     finetune_lr: float = 0.0001,
     finetune_dataset_size: int = 4096,
+    finetune_loss_type: str | None = None,
     bias_correction: bool = True,
+    quantization_groups: int | None = None,
+    quantization_groups_layers: str | None = None,
 ) -> str:
     """Build a Hailo model script from experiment parameters.
 
@@ -93,19 +103,37 @@ def build_model_script(
         optimization_level: DFC optimization level (0-4). 4=AdaRound.
         compression_level: Weight compression (0=full precision, 2=most compressed).
         batch_size: Batch size for calibration (reduce for large inputs).
+        calibset_size: Number of images used for calibration statistics (DFC default=64).
+        normalization_mean: Per-channel mean for input normalization (fused into graph).
+        normalization_std: Per-channel std for input normalization (fused into graph).
         activation_clipping: Comma-separated layer name patterns for activation clipping.
         weights_clipping: Comma-separated layer name patterns for weights clipping.
-        fp16_layers: Comma-separated layer name patterns to keep in a16_w16 precision.
+        fp16_layers: Comma-separated layer name patterns for non-INT8 precision.
+        precision_mode: Precision mode for fp16_layers (a16_w16, a16_w8, a16_w4, a8_w4).
+        fp16_layers_b: Second set of layers with a different precision mode.
+        precision_mode_b: Precision mode for fp16_layers_b.
         finetune: Enable post-quantization finetuning.
         finetune_epochs: Number of finetuning epochs.
         finetune_lr: Finetuning learning rate.
         finetune_dataset_size: Number of samples for finetuning.
+        finetune_loss_type: Loss function for finetuning (l2, l2rel, cosine, ce). None=DFC default.
         bias_correction: Enable bias correction.
+        quantization_groups: Split weights into N groups for independent quantization (2-4).
+        quantization_groups_layers: Comma-separated layer patterns for quantization_groups.
+            If None, applies to all conv layers ({conv*}).
 
     Returns:
         Model script string for runner.load_model_script().
     """
     lines = []
+
+    # Input normalization — fused into first conv layer by the DFC.
+    # Calibration data must be in pre-normalization range (e.g. [0, 255]).
+    # Formula: normalized = (x - mean) / std
+    if normalization_mean is not None and normalization_std is not None:
+        mean_str = ", ".join(f"{v}" for v in normalization_mean)
+        std_str = ", ".join(f"{v}" for v in normalization_std)
+        lines.append(f"input_normalization1 = normalization([{mean_str}], [{std_str}])")
 
     # Core optimization flavor
     lines.append(
@@ -113,6 +141,13 @@ def build_model_script(
         f"optimization_level={optimization_level}, "
         f"compression_level={compression_level}, "
         f"batch_size={batch_size})"
+    )
+
+    # Calibration config — explicitly set calibset_size so all provided images
+    # are used for calibration statistics (DFC default is only 64)
+    lines.append(
+        f"model_optimization_config(calibration, "
+        f"batch_size={batch_size}, calibset_size={calibset_size})"
     )
 
     # Pre-quantization: activation clipping
@@ -133,11 +168,26 @@ def build_model_script(
             f"layers=[{layers_str}], mode=percentile, clipping_values=[0.01, 99.99])"
         )
 
-    # Per-layer FP16 precision
+    # Per-layer precision override (group A)
     if fp16_layers:
         layers = [s.strip() for s in fp16_layers.split(",")]
         for layer in layers:
-            lines.append(f"quantization_param({layer}, precision_mode=a16_w16)")
+            lines.append(f"quantization_param({layer}, precision_mode={precision_mode})")
+
+    # Per-layer precision override (group B — e.g. ew_add layers needing different mode)
+    if fp16_layers_b:
+        layers = [s.strip() for s in fp16_layers_b.split(",")]
+        for layer in layers:
+            lines.append(f"quantization_param({layer}, precision_mode={precision_mode_b})")
+
+    # Per-layer quantization groups — split weights into N groups for finer-grained scales
+    if quantization_groups is not None:
+        if quantization_groups_layers:
+            layers = [s.strip() for s in quantization_groups_layers.split(",")]
+            for layer in layers:
+                lines.append(f"quantization_param({layer}, quantization_groups={quantization_groups})")
+        else:
+            lines.append(f"quantization_param({{conv*}}, quantization_groups={quantization_groups})")
 
     # Post-quantization: bias correction
     if bias_correction:
@@ -145,11 +195,15 @@ def build_model_script(
 
     # Post-quantization: finetuning
     if finetune:
-        lines.append(
-            f"post_quantization_optimization(finetune, policy=enabled, "
-            f"learning_rate={finetune_lr}, epochs={finetune_epochs}, "
-            f"dataset_size={finetune_dataset_size})"
-        )
+        ft_parts = [
+            "post_quantization_optimization(finetune, policy=enabled",
+            f"learning_rate={finetune_lr}",
+            f"epochs={finetune_epochs}",
+            f"dataset_size={finetune_dataset_size}",
+        ]
+        if finetune_loss_type:
+            ft_parts.append(f"def_loss_type={finetune_loss_type}")
+        lines.append(", ".join(ft_parts) + ")")
 
     script = "\n".join(lines)
     return script
@@ -160,6 +214,8 @@ def optimize(
     calib_path: str,
     model_script: str,
     har_path: str | None = None,
+    normalization_mean: list[float] | None = None,
+    normalization_std: list[float] | None = None,
 ) -> ClientRunner:
     """Quantize model with given model script and calibration data.
 
@@ -168,6 +224,8 @@ def optimize(
         calib_path: Path to .npy file with calibration images (NHWC, float32).
         model_script: Hailo model script string.
         har_path: Path to save the quantized HAR file. If None, not saved.
+        normalization_mean: If set, scale calibration data to pre-normalization range.
+        normalization_std: If set, scale calibration data to pre-normalization range.
 
     Returns:
         ClientRunner with quantized model.
@@ -186,6 +244,16 @@ def optimize(
     print(f"  shape={calib_data.shape}, dtype={calib_data.dtype}")
     print(f"  range=[{calib_data.min():.3f}, {calib_data.max():.3f}]")
     print(f"  mean={calib_data.mean():.3f}, std={calib_data.std():.3f}")
+
+    # When normalization is fused into the model, calibration data must be in
+    # the pre-normalization range. Undo the normalization: raw = data * std + mean
+    if normalization_mean is not None and normalization_std is not None:
+        mean = np.array(normalization_mean, dtype=np.float32)
+        std = np.array(normalization_std, dtype=np.float32)
+        calib_data = calib_data * std + mean
+        print(f"Scaled calibration to pre-normalization range:")
+        print(f"  range=[{calib_data.min():.3f}, {calib_data.max():.3f}]")
+        print(f"  mean={calib_data.mean():.3f}, std={calib_data.std():.3f}")
 
     print("\nModel script:")
     for line in model_script.strip().split("\n"):
@@ -281,6 +349,30 @@ def main():
         help="Weight compression: 0=full precision (default), 2=most compressed",
     )
     parser.add_argument("--batch-size", type=int, default=4, help="Calibration batch size")
+    parser.add_argument(
+        "--calibset-size",
+        type=int,
+        default=1024,
+        help="Number of images for calibration statistics (DFC default=64, we use 1024)",
+    )
+
+    # Input normalization (fused into first conv by DFC)
+    parser.add_argument(
+        "--normalization-mean",
+        type=float,
+        nargs=3,
+        default=None,
+        metavar=("R", "G", "B"),
+        help="Per-channel mean for normalization fused into graph. E.g. 0 0 0 for [0,255] input.",
+    )
+    parser.add_argument(
+        "--normalization-std",
+        type=float,
+        nargs=3,
+        default=None,
+        metavar=("R", "G", "B"),
+        help="Per-channel std for normalization fused into graph. E.g. 255 255 255 for [0,255] input.",
+    )
 
     # Clipping
     parser.add_argument(
@@ -301,7 +393,27 @@ def main():
         "--fp16-layers",
         type=str,
         default=None,
-        help="Comma-separated layer patterns to keep in a16_w16 FP16 precision",
+        help="Comma-separated layer patterns for non-INT8 precision (name kept for compat)",
+    )
+    parser.add_argument(
+        "--precision-mode",
+        type=str,
+        default="a16_w16",
+        choices=["a16_w16", "a16_w8", "a16_w4", "a8_w4"],
+        help="Precision mode for --fp16-layers (default: a16_w16)",
+    )
+    parser.add_argument(
+        "--fp16-layers-b",
+        type=str,
+        default=None,
+        help="Second layer group with different precision (e.g. ew_add layers)",
+    )
+    parser.add_argument(
+        "--precision-mode-b",
+        type=str,
+        default="a16_w16",
+        choices=["a16_w16", "a16_w8", "a16_w4", "a8_w4"],
+        help="Precision mode for --fp16-layers-b (default: a16_w16)",
     )
 
     # Post-quantization
@@ -311,6 +423,27 @@ def main():
     parser.add_argument("--finetune-lr", type=float, default=0.0001, help="Finetuning learning rate")
     parser.add_argument(
         "--finetune-dataset-size", type=int, default=4096, help="Number of samples for finetuning"
+    )
+    parser.add_argument(
+        "--finetune-loss-type",
+        type=str,
+        default=None,
+        choices=["l2", "l2rel", "l2rel_chw", "ce"],
+        help="Loss function for finetuning (l2, l2rel, l2rel_chw, ce). Default: DFC default 'l2rel'.",
+    )
+
+    # Quantization groups
+    parser.add_argument(
+        "--quantization-groups",
+        type=int,
+        default=None,
+        help="Split weight quantization into N groups for finer scales (2-4)",
+    )
+    parser.add_argument(
+        "--quantization-groups-layers",
+        type=str,
+        default=None,
+        help="Layer patterns for quantization_groups (default: all conv layers)",
     )
 
     # Control
@@ -340,14 +473,23 @@ def main():
         optimization_level=args.optimization_level,
         compression_level=args.compression_level,
         batch_size=args.batch_size,
+        calibset_size=args.calibset_size,
+        normalization_mean=args.normalization_mean,
+        normalization_std=args.normalization_std,
         activation_clipping=args.activation_clipping,
         weights_clipping=args.weights_clipping,
         fp16_layers=args.fp16_layers,
+        precision_mode=args.precision_mode,
+        fp16_layers_b=args.fp16_layers_b,
+        precision_mode_b=args.precision_mode_b,
         finetune=args.finetune,
         finetune_epochs=args.finetune_epochs,
         finetune_lr=args.finetune_lr,
         finetune_dataset_size=args.finetune_dataset_size,
+        finetune_loss_type=args.finetune_loss_type,
         bias_correction=not args.no_bias_correction,
+        quantization_groups=args.quantization_groups,
+        quantization_groups_layers=args.quantization_groups_layers,
     )
 
     print(f"Experiment: {experiment}")
@@ -373,7 +515,14 @@ def main():
         return
 
     # Optimize
-    runner = optimize(runner, calib_path=args.calib_data, model_script=model_script, har_path=quantized_har)
+    runner = optimize(
+        runner,
+        calib_path=args.calib_data,
+        model_script=model_script,
+        har_path=quantized_har,
+        normalization_mean=args.normalization_mean,
+        normalization_std=args.normalization_std,
+    )
 
     if args.skip_compile:
         print("\nSkip-compile mode — stopping after optimize.")

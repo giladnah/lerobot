@@ -47,13 +47,18 @@ class ExperimentConfig:
     description: str
     optimization_level: int = 4
     compression_level: int = 0
+    calibset_size: int = 1024
     activation_clipping: str | None = None
     weights_clipping: str | None = None
     fp16_layers: str | None = None
+    precision_mode: str = "a16_w16"
     finetune: bool = False
     finetune_epochs: int = 8
     finetune_lr: float = 0.0001
+    finetune_loss_type: str | None = None
     no_bias_correction: bool = False
+    quantization_groups: int | None = None
+    quantization_groups_layers: str | None = None
 
 
 # Default experiment sequence — each builds on the previous
@@ -131,6 +136,8 @@ def run_compile(exp: ExperimentConfig, python: str = sys.executable) -> tuple[st
         str(exp.optimization_level),
         "--compression-level",
         str(exp.compression_level),
+        "--calibset-size",
+        str(exp.calibset_size),
     ]
 
     if exp.activation_clipping:
@@ -139,6 +146,8 @@ def run_compile(exp: ExperimentConfig, python: str = sys.executable) -> tuple[st
         cmd.extend(["--weights-clipping", exp.weights_clipping])
     if exp.fp16_layers:
         cmd.extend(["--fp16-layers", exp.fp16_layers])
+    if exp.precision_mode != "a16_w16":
+        cmd.extend(["--precision-mode", exp.precision_mode])
     if exp.finetune:
         cmd.extend(
             [
@@ -149,8 +158,14 @@ def run_compile(exp: ExperimentConfig, python: str = sys.executable) -> tuple[st
                 str(exp.finetune_lr),
             ]
         )
+        if exp.finetune_loss_type:
+            cmd.extend(["--finetune-loss-type", exp.finetune_loss_type])
     if exp.no_bias_correction:
         cmd.append("--no-bias-correction")
+    if exp.quantization_groups is not None:
+        cmd.extend(["--quantization-groups", str(exp.quantization_groups)])
+    if exp.quantization_groups_layers:
+        cmd.extend(["--quantization-groups-layers", exp.quantization_groups_layers])
 
     print(f"\n{'=' * 70}")
     print(f"Compiling: {exp.name}")
@@ -330,12 +345,15 @@ def main():
             script = build_model_script(
                 optimization_level=exp.optimization_level,
                 compression_level=exp.compression_level,
+                calibset_size=exp.calibset_size,
                 activation_clipping=exp.activation_clipping,
                 weights_clipping=exp.weights_clipping,
                 fp16_layers=exp.fp16_layers,
+                precision_mode=exp.precision_mode,
                 finetune=exp.finetune,
                 finetune_epochs=exp.finetune_epochs,
                 finetune_lr=exp.finetune_lr,
+                finetune_loss_type=exp.finetune_loss_type,
                 bias_correction=not exp.no_bias_correction,
             )
             print(f"\n--- {exp.name} ---")
